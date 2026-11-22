@@ -37,6 +37,14 @@ void kv_write(const float* k, const float* v, int rows, int kvh, int hd, int64_t
 void attention(const float* q, const uint16_t* kc, const uint16_t* vc, int rows, int n_head, int kvh, int hd, int64_t pos0,
                int window, int ring, float* out, void* stream);
 
+/// attention by kernel: `attention_simple` is a block per (head, row) with CUDA-core dot products (any hd <= 512; what
+/// attention runs for a decode window of rows <= 8); `attention_tiled` is the prompt kernel (attn.cu: query tiles, fp16
+/// tensor cores, K/V tiles shared by the KV group), hd 256 or 512 only: false, with nothing enqueued, for another layout.
+void attention_simple(const float* q, const uint16_t* kc, const uint16_t* vc, int rows, int n_head, int kvh, int hd,
+                      int64_t pos0, int window, int ring, float* out, void* stream);
+bool attention_tiled(const float* q, const uint16_t* kc, const uint16_t* vc, int rows, int n_head, int kvh, int hd,
+                     int64_t pos0, int window, int ring, float* out, void* stream);
+
 /// The router of `rows` rows: x / rms(x) / sqrt(d) * scale, its logits through w ([n_expert][d] f32), the softmax's top
 /// `k` renormalised. ids[r*k + j], weights[r*k + j]. n_expert <= 256, k <= 16, d <= 4096.
 /// `logits`: scratch of rows * n_expert floats (n_expert <= 256, k <= 16).
