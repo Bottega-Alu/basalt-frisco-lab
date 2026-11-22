@@ -24,24 +24,26 @@ void norm2_sum(const float* a, const float* wa, const float* b, const float* wb,
 /// In place on heads of `hd` values (`n_heads` per row, rows `row_stride` floats apart): RMS norm with weight `w` (null:
 /// none), then, when `base` > 0, NEOX RoPE over the whole head at position pos0 + row: pair (i, i + hd/2) turns by
 /// pos * base^(-2i/hd) / ff[i] (ff null: 1).
+/// `pos_dev` (here and in kv_write / attention): when given, pos0 is read from it on the device instead (one int64), so a
+/// captured graph replays at any position.
 void head_norm_rope(float* x, const float* w, int rows, int n_heads, int hd, int row_stride, int64_t pos0, float base,
-                    const float* ff, float eps, void* stream);
+                    const float* ff, float eps, void* stream, const int64_t* pos_dev = nullptr);
 
 /// Writes rows' K and V (f32, [rows][kvh*hd]) as f16 into the caches at position pos0 + row: cell pos % ring (ring 0:
 /// cell pos).
 void kv_write(const float* k, const float* v, int rows, int kvh, int hd, int64_t pos0, int ring, uint16_t* kc, uint16_t* vc,
-              void* stream);
+              void* stream, const int64_t* pos_dev = nullptr);
 
 /// out[r][h] = softmax(q[r][h] . K) V over the cached positions row r sees (pos0 + r back to the window's start; window 0:
 /// position 0), scale 1. q and out are [rows][n_head*hd]; head h reads K/V head h / (n_head / kvh). hd <= 512.
 void attention(const float* q, const uint16_t* kc, const uint16_t* vc, int rows, int n_head, int kvh, int hd, int64_t pos0,
-               int window, int ring, float* out, void* stream);
+               int window, int ring, float* out, void* stream, const int64_t* pos_dev = nullptr);
 
 /// attention by kernel: `attention_simple` is a block per (head, row) with CUDA-core dot products (any hd <= 512; what
 /// attention runs for a decode window of rows <= 8); `attention_tiled` is the prompt kernel (attn.cu: query tiles, fp16
 /// tensor cores, K/V tiles shared by the KV group), hd 256 or 512 only: false, with nothing enqueued, for another layout.
 void attention_simple(const float* q, const uint16_t* kc, const uint16_t* vc, int rows, int n_head, int kvh, int hd,
-                      int64_t pos0, int window, int ring, float* out, void* stream);
+                      int64_t pos0, int window, int ring, float* out, void* stream, const int64_t* pos_dev = nullptr);
 bool attention_tiled(const float* q, const uint16_t* kc, const uint16_t* vc, int rows, int n_head, int kvh, int hd,
                      int64_t pos0, int window, int ring, float* out, void* stream);
 

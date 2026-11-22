@@ -87,8 +87,10 @@ __global__ void norm2_sum_kernel(const float* __restrict__ a, const float* __res
 
 // a block per (head, row), hd/2 threads: thread i holds the pair (i, i + hd/2)
 __global__ void head_norm_rope_kernel(float* __restrict__ x, const float* __restrict__ w, int hd, int row_stride,
-                                      int64_t pos0, float base, const float* __restrict__ ff, float eps) {
+                                      int64_t pos0, float base, const float* __restrict__ ff, float eps,
+                                      const int64_t* __restrict__ pos_dev) {
     __shared__ float red[kWarps * 2];
+    if (pos_dev) pos0 = *pos_dev;
     const int half = hd / 2, i = threadIdx.x;
     float* h = x + (size_t) blockIdx.y * row_stride + (size_t) blockIdx.x * hd;
     float a = h[i], b = h[i + half];
@@ -110,7 +112,8 @@ __global__ void head_norm_rope_kernel(float* __restrict__ x, const float* __rest
 }
 
 __global__ void kv_write_kernel(const float* __restrict__ k, const float* __restrict__ v, int width, int64_t pos0, int ring,
-                                __half* __restrict__ kc, __half* __restrict__ vc) {
+                                __half* __restrict__ kc, __half* __restrict__ vc, const int64_t* __restrict__ pos_dev) {
+    if (pos_dev) pos0 = *pos_dev;
     const int64_t pos = pos0 + blockIdx.x;
     const int64_t cell = ring > 0 ? pos % ring : pos;
     for (int i = threadIdx.x; i < width; i += blockDim.x) {
@@ -123,8 +126,10 @@ __global__ void kv_write_kernel(const float* __restrict__ k, const float* __rest
 template<int HD>
 __global__ void __launch_bounds__(kBlock) attention_kernel(const float* __restrict__ q, const __half* __restrict__ kc,
                                                           const __half* __restrict__ vc, int n_head, int kvh, int64_t pos0,
-                                                          int window, int ring, float* __restrict__ out) {
+                                                          int window, int ring, float* __restrict__ out,
+                                                          const int64_t* __restrict__ pos_dev) {
     constexpr int V = HD / 32;
+    if (pos_dev) pos0 = *pos_dev;
     __shared__ float sm[kWarps], sl[kWarps];
     __shared__ float sacc[kWarps][HD];
     const int h = blockIdx.x, r = blockIdx.y, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -283,30 +288,31 @@ void norm2_sum(const float* a, const float* wa, const float* b, const float* wb,
 }
 
 void head_norm_rope(float* x, const float* w, int rows, int n_heads, int hd, int row_stride, int64_t pos0, float base,
-                    const float* ff, float eps, void* stream) {
+                    const float* ff, float eps, void* stream, const int64_t* pos_dev) {
     head_norm_rope_kernel<<<dim3((unsigned) n_heads, (unsigned) rows), hd / 2, 0, (cudaStream_t) stream>>>(
-        x, w, hd, row_stride, pos0, base, ff, eps);
+        x, w, hd, row_stride, pos0, base, ff, eps, pos_dev);
 }
 
 void kv_write(const float* k, const float* v, int rows, int kvh, int hd, int64_t pos0, int ring, uint16_t* kc, uint16_t* vc,
-              void* stream) {
-    kv_write_kernel<<<rows, kBlock, 0, (cudaStream_t) stream>>>(k, v, kvh * hd, pos0, ring, (__half*) kc, (__half*) vc);
+              void* stream, const int64_t* pos_dev) {
+    kv_write_kernel<<<rows, kBlock, 0, (cudaStream_t) stream>>>(k, v, kvh * hd, pos0, ring, (__half*) kc, (__half*) vc, pos_dev);
 }
 
 void attention(const float* q, const uint16_t* kc, const uint16_t* vc, int rows, int n_head, int kvh, int hd, int64_t pos0,
-               int window, int ring, float* out, void* stream) {
+               int window, int ring, float* out, void* stream, const int64_t* pos_dev) {
+    // the tiled kernel takes pos0 from the host: prompt chunks run eagerly (graphs capture only rows <= 8), so it is current
     if (rows > 8 && attention_tiled(q, kc, vc, rows, n_head, kvh, hd, pos0, window, ring, out, stream)) return;
-    attention_simple(q, kc, vc, rows, n_head, kvh, hd, pos0, window, ring, out, stream);
+    attention_simple(q, kc, vc, rows, n_head, kvh, hd, pos0, window, ring, out, stream, pos_dev);
 }
 
 void attention_simple(const float* q, const uint16_t* kc, const uint16_t* vc, int rows, int n_head, int kvh, int hd,
-                      int64_t pos0, int window, int ring, float* out, void* stream) {
+                      int64_t pos0, int window, int ring, float* out, void* stream, const int64_t* pos_dev) {
     const dim3 grid((unsigned) n_head, (unsigned) rows);
     cudaStream_t s = (cudaStream_t) stream;
     if (hd == 256)
-        attention_kernel<256><<<grid, kBlock, 0, s>>>(q, (const __half*) kc, (const __half*) vc, n_head, kvh, pos0, window, ring, out);
+        attention_kernel<256><<<grid, kBlock, 0, s>>>(q, (const __half*) kc, (const __half*) vc, n_head, kvh, pos0, window, ring, out, pos_dev);
     else
-        attention_kernel<512><<<grid, kBlock, 0, s>>>(q, (const __half*) kc, (const __half*) vc, n_head, kvh, pos0, window, ring, out);
+        attention_kernel<512><<<grid, kBlock, 0, s>>>(q, (const __half*) kc, (const __half*) vc, n_head, kvh, pos0, window, ring, out, pos_dev);
 }
 
 void router_topk(const float* x, const float* scale, const float* w, int rows, int d, int n_expert, int k, float eps,
