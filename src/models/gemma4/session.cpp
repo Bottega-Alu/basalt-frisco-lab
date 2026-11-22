@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <string>
@@ -61,6 +62,7 @@ public:
 
     ~Session() override {
         if (stream_) cudaStreamSynchronize(stream_);
+        drop_graphs();
         for (void* p : bufs_) cudaFree(p);
         for (void* p : pinned_) cudaFreeHost(p);
         if (bias_) cudaFree(bias_);
@@ -105,7 +107,10 @@ public:
         plans_d_ = (Plan*) alloc(sizeof(Plan) * (size_t) g_.n_layers, ok);
         rw_ = (float*) alloc((size_t) R * 16 * 4, ok);
         rlog_ = (float*) alloc((size_t) R * g_.n_expert * 4, ok);
-        tok_d_ = (int32_t*) alloc((size_t) R * 4, ok);
+        // a call's uploads, one copy: its first position (int64, read by the position-dependent kernels) and its tokens
+        up_d_ = alloc(8 + (size_t) R * 4, ok);
+        pos_d_ = (int64_t*) up_d_;
+        tok_d_ = (int32_t*) ((uint8_t*) up_d_ + 8);
         eo_ = (float*) alloc((size_t) R * 16 * D * 4, ok);
         if (big) {
             const int64_t P = (int64_t) R * g_.n_used;
@@ -137,14 +142,19 @@ public:
         if (!ok) { cudaGetLastError(); err = "out of device memory for the session's buffers and caches"; return false; }
         if (cudaHostAlloc((void**) &ids_h_, (size_t) R * 16 * 4, cudaHostAllocDefault) != cudaSuccess ||
             (big && cudaHostAlloc((void**) &pplan_h_, sizeof(PromptPlan), cudaHostAllocDefault) != cudaSuccess) ||
-            cudaHostAlloc((void**) &tok_h_, (size_t) R * 4, cudaHostAllocDefault) != cudaSuccess ||
+            cudaHostAlloc((void**) &up_h_, 8 + (size_t) R * 4, cudaHostAllocDefault) != cudaSuccess ||
             cudaHostAlloc((void**) &win_ids_h_, (size_t) g_.n_layers * kMaxEntries * 4, cudaHostAllocDefault) != cudaSuccess ||
             cudaHostAlloc((void**) &slot_h_, (size_t) g_.n_layers * g_.n_expert * 4, cudaHostAllocDefault) != cudaSuccess) {
             cudaGetLastError();
             err = "cannot pin the session's host buffers";
             return false;
         }
-        pinned_ = {ids_h_, tok_h_, win_ids_h_, slot_h_};
+        pos_h_ = (int64_t*) up_h_;
+        tok_h_ = (int32_t*) ((uint8_t*) up_h_ + 8);
+        pinned_ = {ids_h_, up_h_, win_ids_h_, slot_h_};
+        // decode windows replay a captured graph per (rows, head rows); GEMMA4_GRAPHS=0 launches every kernel instead
+        if (const char* e = std::getenv("GEMMA4_GRAPHS")) graphs_on_ = std::strcmp(e, "0") != 0;
+        if (!graphs_on_) basalt::log::info("basalt gemma4", "GEMMA4_GRAPHS=0: decode windows run without CUDA graphs");
         if (pplan_h_) pinned_.push_back(pplan_h_);
         if (big) {
             mmq::iota(ident_, (int64_t) R * g_.n_used, stream_);
@@ -350,10 +360,80 @@ private:
     bool run_rows(const int32_t* tokens, int n, int64_t pos0, int head, std::string& err) {
         if (!check_positions(pos0, err)) return false;
         hw_dbg_ = pos0 + n - 1;
+        if (head > kMaxRows) {
+            err = "a prompt step's logits were asked for";
+            return false;
+        }
+        *pos_h_ = pos0;
+        std::memcpy(tok_h_, tokens, (size_t) n * 4);
+        cudaMemcpyAsync(up_d_, up_h_, 8 + (size_t) n * 4, cudaMemcpyHostToDevice, stream_);
+        const bool graph = graphs_on_ && n <= kMaxRows && m_.flags().diag_dump.empty();
+        if (!(graph ? graph_rows(n, pos0, head, err) : rows_body(n, pos0, head, err))) return false;
+        hw_ = pos0 + n;
+        if (head > 0) last_rows_ = head;
+        if (cudaGetLastError() != cudaSuccess) {
+            err = "a kernel launch failed";
+            return false;
+        }
+        return true;
+    }
+
+    // A decode window's rows (n <= kMaxRows) as one graph per (n, head): the first call of a shape runs as launched (the
+    // kernels load), then is captured for the next ones. Everything the body reads that varies from call to call is in
+    // device memory (the tokens and the first position uploaded above, the slot table, the caches), so the replay runs
+    // at any position. The graphs hold the session's and the model's buffers: they go when the expert arena moves.
+    bool graph_rows(int n, int64_t pos0, int head, std::string& err) {
+        if (m_.cache().arena != graph_arena_) {
+            drop_graphs();
+            graph_arena_ = m_.cache().arena;
+        }
+        cudaGraphExec_t& ge = graphs_[n][head];
+        if (ge) {
+            if (cudaGraphLaunch(ge, stream_) == cudaSuccess) return true;
+            err = std::string("the window graph failed: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        if (!rows_body(n, pos0, head, err)) return false;
+        if (cudaGetLastError() != cudaSuccess) {
+            err = "a kernel launch failed";
+            return false;
+        }
+        cudaGraph_t graph = nullptr;
+        bool ok = cudaStreamBeginCapture(stream_, cudaStreamCaptureModeRelaxed) == cudaSuccess;
+        if (ok) {
+            std::string e2;
+            const bool body = rows_body(n, pos0, head, e2);
+            ok = cudaStreamEndCapture(stream_, &graph) == cudaSuccess && body && graph &&
+                 cudaGraphInstantiate(&ge, graph, 0) == cudaSuccess;
+        }
+        if (graph) cudaGraphDestroy(graph);
+        if (!ok) {
+            // the window already ran as launched: the session goes on without graphs
+            const cudaError_t e = cudaGetLastError();
+            if (ge) cudaGraphExecDestroy(ge);
+            ge = nullptr;
+            graphs_on_ = false;
+            basalt::log::warn("basalt gemma4", "the decode window could not be captured (%s): running without CUDA graphs",
+                              cudaGetErrorString(e));
+        }
+        return true;
+    }
+
+    void drop_graphs() {
+        for (auto& per_n : graphs_)
+            for (cudaGraphExec_t& ge : per_n)
+                if (ge) {
+                    cudaGraphExecDestroy(ge);
+                    ge = nullptr;
+                }
+    }
+
+    // The forward's device work of `n` rows at pos0 (uploaded by run_rows), the logits of the last `head` rows into logits_.
+    // Enqueues only (a prompt step's experts excepted, n > kMaxRows): a decode window's is captured as it is.
+    bool rows_body(int n, int64_t pos0, int head, std::string& err) {
         const int D = g_.n_embd, H = g_.n_head;
         const float eps = g_.rms_eps;
-        std::memcpy(tok_h_, tokens, (size_t) n * 4);
-        cudaMemcpyAsync(tok_d_, tok_h_, (size_t) n * 4, cudaMemcpyHostToDevice, stream_);
+        const int64_t* pd = pos_d_;
         ops::embed_rows((const uint8_t*) m_.tensor("token_embd.weight")->ptr, tok_d_, n, D, std::sqrt((float) D), x_, stream_);
         const float* ff = (const float*) m_.tensor("rope_freqs.weight")->ptr;
         for (int l = 0; l < g_.n_layers; ++l) {
@@ -368,11 +448,12 @@ private:
             if (const void* wv = q8(l, "attn_v.weight")) mm(wv, v_, D, kw, n);
             else ops::copy(v_, k_, (int64_t) n * kw, stream_);   // K = V: the value is the key's projection
             const float base = swa ? g_.rope_base_swa : g_.rope_base;
-            ops::head_norm_rope(q_, f32(l, "attn_q_norm.weight"), n, H, hd, qw, pos0, base, swa ? nullptr : ff, eps, stream_);
-            ops::head_norm_rope(v_, nullptr, n, kvh, hd, kw, pos0, 0.f, nullptr, eps, stream_);
-            ops::head_norm_rope(k_, f32(l, "attn_k_norm.weight"), n, kvh, hd, kw, pos0, base, swa ? nullptr : ff, eps, stream_);
-            ops::kv_write(k_, v_, n, kvh, hd, pos0, swa ? ring_ : 0, kc_[(size_t) l], vc_[(size_t) l], stream_);
-            ops::attention(q_, kc_[(size_t) l], vc_[(size_t) l], n, H, kvh, hd, pos0, swa ? g_.window : 0, swa ? ring_ : 0, att_, stream_);
+            ops::head_norm_rope(q_, f32(l, "attn_q_norm.weight"), n, H, hd, qw, pos0, base, swa ? nullptr : ff, eps, stream_, pd);
+            ops::head_norm_rope(v_, nullptr, n, kvh, hd, kw, pos0, 0.f, nullptr, eps, stream_, pd);
+            ops::head_norm_rope(k_, f32(l, "attn_k_norm.weight"), n, kvh, hd, kw, pos0, base, swa ? nullptr : ff, eps, stream_, pd);
+            ops::kv_write(k_, v_, n, kvh, hd, pos0, swa ? ring_ : 0, kc_[(size_t) l], vc_[(size_t) l], stream_, pd);
+            ops::attention(q_, kc_[(size_t) l], vc_[(size_t) l], n, H, kvh, hd, pos0, swa ? g_.window : 0, swa ? ring_ : 0, att_,
+                           stream_, pd);
             quant(att_, qw, n);
             mm(q8(l, "attn_output.weight"), tmp_, qw, D, n);
             ops::norm_add(x_, tmp_, f32(l, "post_attention_norm.weight"), n, D, eps, nullptr, stream_);
@@ -399,22 +480,12 @@ private:
             ops::norm_add(x_, tmp_, f32(l, "post_ffw_norm.weight"), n, D, eps, f32(l, "layer_output_scale.weight"), stream_);
             if (!m_.flags().diag_dump.empty()) dump_row(l, pos0 + n - 1, x_ + (size_t) (n - 1) * D);
         }
-        hw_ = pos0 + n;
-        if (head > kMaxRows) {
-            err = "a prompt step's logits were asked for";
-            return false;
-        }
         if (head > 0) {
             const float* xl = x_ + (size_t) (n - head) * D;
             ops::rms_norm(xl, (const float*) m_.tensor("output_norm.weight")->ptr, xn_, head, D, eps, stream_);
             bk::native_quantize_q8_1(xn_, xq_, D, head, stream_);
             bk::native_q8_0_mmvq(m_.tensor("token_embd.weight")->ptr, xq_, logits_, D, g_.n_vocab, head, stream_);
             if (g_.softcap > 0.f) ops::softcap(logits_, (int64_t) head * g_.n_vocab, g_.softcap, stream_);
-            last_rows_ = head;
-        }
-        if (cudaGetLastError() != cudaSuccess) {
-            err = "a kernel launch failed";
-            return false;
         }
         return true;
     }
@@ -689,6 +760,13 @@ private:
     void *xq_ = nullptr, *xq2_ = nullptr, *escratch_ = nullptr;
     int32_t *ids_ = nullptr, *tok_d_ = nullptr, *pick_ = nullptr;
     int32_t *ids_h_ = nullptr, *tok_h_ = nullptr;
+    // a call's upload (its first position, then its tokens) on the device and in pinned staging
+    void *up_d_ = nullptr, *up_h_ = nullptr;
+    int64_t *pos_d_ = nullptr, *pos_h_ = nullptr;
+    // the decode windows' graphs, [rows][head rows], and the expert arena they were captured over
+    bool graphs_on_ = true;
+    cudaGraphExec_t graphs_[kMaxRows + 1][kMaxRows + 1] = {};
+    const uint8_t* graph_arena_ = nullptr;
     std::vector<uint16_t*> kc_, vc_;
     int ring_ = 0, rows_ = kMaxRows;
     float* rlog_ = nullptr;   // the router's logits

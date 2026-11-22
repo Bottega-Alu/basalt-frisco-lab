@@ -24,18 +24,20 @@ void norm2_sum(const float* a, const float* wa, const float* b, const float* wb,
 /// In place on heads of `hd` values (`n_heads` per row, rows `row_stride` floats apart): RMS norm with weight `w` (null:
 /// none), then, when `base` > 0, NEOX RoPE over the whole head at position pos0 + row: pair (i, i + hd/2) turns by
 /// pos * base^(-2i/hd) / ff[i] (ff null: 1).
+/// `pos_dev` (here and in kv_write / attention): when given, pos0 is read from it on the device instead (one int64), so a
+/// captured graph replays at any position.
 void head_norm_rope(float* x, const float* w, int rows, int n_heads, int hd, int row_stride, int64_t pos0, float base,
-                    const float* ff, float eps, void* stream);
+                    const float* ff, float eps, void* stream, const int64_t* pos_dev = nullptr);
 
 /// Writes rows' K and V (f32, [rows][kvh*hd]) as f16 into the caches at position pos0 + row: cell pos % ring (ring 0:
 /// cell pos).
 void kv_write(const float* k, const float* v, int rows, int kvh, int hd, int64_t pos0, int ring, uint16_t* kc, uint16_t* vc,
-              void* stream);
+              void* stream, const int64_t* pos_dev = nullptr);
 
 /// out[r][h] = softmax(q[r][h] . K) V over the cached positions row r sees (pos0 + r back to the window's start; window 0:
 /// position 0), scale 1. q and out are [rows][n_head*hd]; head h reads K/V head h / (n_head / kvh). hd <= 512.
 void attention(const float* q, const uint16_t* kc, const uint16_t* vc, int rows, int n_head, int kvh, int hd, int64_t pos0,
-               int window, int ring, float* out, void* stream);
+               int window, int ring, float* out, void* stream, const int64_t* pos_dev = nullptr);
 
 /// The router of `rows` rows: x / rms(x) / sqrt(d) * scale, its logits through w ([n_expert][d] f32), the softmax's top
 /// `k` renormalised. ids[r*k + j], weights[r*k + j]. n_expert <= 256, k <= 16, d <= 4096.
