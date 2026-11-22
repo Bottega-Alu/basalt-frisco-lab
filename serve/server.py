@@ -242,10 +242,13 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
         tokens = [None] * len(vocab)
         for t, i in vocab.items():
             tokens[i] = t
-        merges = files["merges.txt"].decode("utf-8").split("\n")
+        tcfg = json.loads(files["tokenizer.json"].decode("utf-8")) if "tokenizer.json" in files else {}
+        if "merges.json" in files:   # a SentencePiece-style vocabulary: its merges hold newlines, so pairs in JSON
+            merges = [" ".join(p) for p in json.loads(files["merges.json"].decode("utf-8"))]
+        else:
+            merges = files["merges.txt"].decode("utf-8").split("\n")
         types = json.loads(files["token_type.json"])
-        pre = json.loads(files["tokenizer.json"].decode("utf-8")).get("pre", "qwen35") if "tokenizer.json" in files else "qwen35"
-        tok = ST.Tokenizer(tokens, merges, types, pre=pre)
+        tok = ST.Tokenizer(tokens, merges, types, pre=tcfg.get("pre", "qwen35"), model=tcfg.get("model", "gpt2"))
     has_grammar = False
     if not a.mock_engine:
         vision = None

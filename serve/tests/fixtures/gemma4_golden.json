@@ -1,0 +1,115 @@
+{
+ "base": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Ciao, come va?"
+   }
+  ],
+  "tools": null,
+  "kwargs": {},
+  "prompt": "<bos><|turn>user\nCiao, come va?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+ },
+ "thinking": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Quanto fa 17*23?"
+   }
+  ],
+  "tools": null,
+  "kwargs": {
+   "enable_thinking": true
+  },
+  "prompt": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nQuanto fa 17*23?<turn|>\n<|turn>model\n"
+ },
+ "system": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "Rispondi in italiano."
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "tools": null,
+  "kwargs": {},
+  "prompt": "<bos><|turn>system\nRispondi in italiano.<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+ },
+ "multi": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Uno"
+   },
+   {
+    "role": "assistant",
+    "content": "Due"
+   },
+   {
+    "role": "user",
+    "content": "Tre"
+   }
+  ],
+  "tools": null,
+  "kwargs": {},
+  "prompt": "<bos><|turn>user\nUno<turn|>\n<|turn>model\nDue<turn|>\n<|turn>user\nTre<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+ },
+ "tools": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Che tempo fa a Roma?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Roma",
+        "days": 2
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "{\"temp\": 21, \"sky\": \"sereno\"}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "kwargs": {},
+  "prompt": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Current weather for a city<|\"|>,parameters:{properties:{city:{type:<|\"|>STRING<|\"|>},days:{type:<|\"|>INTEGER<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nChe tempo fa a Roma?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Roma<|\"|>,days:2}<tool_call|><|tool_response>response:get_weather{value:<|\"|>{\"temp\": 21, \"sky\": \"sereno\"}<|\"|>}<tool_response|>"
+ }
+}

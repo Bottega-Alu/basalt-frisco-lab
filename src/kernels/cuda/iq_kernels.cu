@@ -3297,7 +3297,26 @@ __global__ void __launch_bounds__(256) swiglu_softcap_q8_1_entries_kernel(const 
     }
 }
 
-enum class Act { Plain, Clamp, Softcap };
+// GeGLU (gelu with the tanh approximation, as Gemma 4's experts and llama.cpp's ggml_gelu), then the q8_1 blocks (the
+// same pass as swiglu_q8_1_entries_kernel): h = 0.5 g (1 + tanh(sqrt(2/pi) (g + 0.044715 g^3))) up, in fp32.
+template<bool PDL>
+__global__ void __launch_bounds__(256) geglu_q8_1_entries_kernel(const float* __restrict__ gate,
+                                                                 const float* __restrict__ up,
+                                                                 const int32_t* __restrict__ grp_start,
+                                                                 const int32_t* __restrict__ n_groups, int n_ff,
+                                                                 block_q8_1* __restrict__ hq) {
+    if constexpr (PDL) pdl_trigger();
+    const long long lo = (long long) grp_start[0] * n_ff, hi = (long long) grp_start[*n_groups] * n_ff;
+    if constexpr (PDL) pdl_wait();
+    for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
+         i += (long long) gridDim.x * blockDim.x) {
+        const float g = gate[i];
+        const float gl = 0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g)));
+        q8_1_store(__fmul_rn(gl, up[i]), hq, i);
+    }
+}
+
+enum class Act { Plain, Clamp, Softcap, Gelu };
 
 // native_expert_grouped's body; ACT selects the activation at compile time, so the plain instantiation is the original
 // launch sequence.
@@ -3346,7 +3365,14 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
     check("native_expert_grouped/gu");
     const long long nh = (long long) cap_entries * L.n_ff;
     const bool sw_v1 = v1;
-    if constexpr (ACT == Act::Softcap) {
+    if constexpr (ACT == Act::Gelu) {
+        if (chain)
+            launch_dependent(geglu_q8_1_entries_kernel<true>, dim3((unsigned) ((nh + 255) / 256)), s, (const float*) gate,
+                             (const float*) up, grp_start, n_groups, (int) L.n_ff, hq);
+        else
+            geglu_q8_1_entries_kernel<false><<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, grp_start, n_groups,
+                                                                                          (int) L.n_ff, hq);
+    } else if constexpr (ACT == Act::Softcap) {
         if (chain)
             launch_dependent(swiglu_softcap_q8_1_entries_kernel<true>, dim3((unsigned) ((nh + 255) / 256)), s,
                              (const float*) gate, (const float*) up, grp_start, n_groups, (int) L.n_ff, L.gate_softcap,
@@ -3391,7 +3417,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups) {
-    if (L.gate_softcap > 0.0f)
+    if (L.gelu)
+        grouped_impl<Act::Gelu>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch,
+                                out, stream, grid_groups, 0.0f);
+    else if (L.gate_softcap > 0.0f)
         grouped_impl<Act::Softcap>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1,
                                    scratch, out, stream, grid_groups, 0.0f);
     else if (L.swiglu_limit > 0.0f)

@@ -590,9 +590,12 @@ def convert(a) -> None:
 
 
 def convert_bf16(a) -> None:
-    """--nvfp4: the hy4flash release pack from the BF16 GGUF."""
-    import hy4flash_bf16
-    hy4flash_bf16.build(a, Job, DryWriter, fingerprint, source_record, source_tensors, export_tokenizer)
+    """--nvfp4: the hy4flash or gemma4 pack from the BF16 GGUF."""
+    if source_architecture(Path(a.gguf[0])) == "gemma4":
+        import gemma4_bf16 as mod
+    else:
+        import hy4flash_bf16 as mod
+    mod.build(a, Job, DryWriter, fingerprint, source_record, source_tensors, export_tokenizer)
 
 
 def warn_unofficial():
@@ -939,10 +942,13 @@ def main():
     if a.nvfp4:
         if a.sections_from or a.mtp_source or a.mtp_dense or a.draft_vocab or a.dspark:
             ap.error("--nvfp4 takes --gguf, --hf-dir, --mmproj, --dfly, --dense-q6k, --name, --workers, --dry-run, --no-vision and --force")
-        if source_architecture(Path(a.gguf[0])) != "hy_v4_flash" or not a.hf_dir:
-            ap.error("--nvfp4 takes a hy_v4_flash BF16 GGUF and --hf-dir")
-        if not a.mmproj and not a.no_vision:
+        src_arch = source_architecture(Path(a.gguf[0]))
+        if src_arch not in ("hy_v4_flash", "gemma4") or not a.hf_dir:
+            ap.error("--nvfp4 takes a hy_v4_flash or gemma4 BF16 GGUF and --hf-dir")
+        if src_arch == "hy_v4_flash" and not a.mmproj and not a.no_vision:
             ap.error("--mmproj is required unless --no-vision")
+        if src_arch == "gemma4" and (a.mmproj or a.dfly or a.dense_q6k):
+            ap.error("--nvfp4 with a gemma4 GGUF takes no --mmproj, --dfly or --dense-q6k (text only, Q8_0 dense)")
         convert_bf16(a)
         return
     arch = A.for_architecture(source_architecture(Path(a.gguf[0])))

@@ -59,7 +59,8 @@ def sampling_defaults(meta: dict) -> dict:
     return {field: _short(kv[key]) for key, field in GGUF_SAMPLING.items() if kv.get(key) is not None}
 
 
-TOKENIZER_SECTIONS = ("vocab.json", "merges.txt", "token_type.json", "tokenizer.json", "chat_template.jinja")
+TOKENIZER_SECTIONS = ("vocab.json", "merges.txt", "merges.json", "token_type.json", "tokenizer.json",
+                      "chat_template.jinja")
 
 
 def tokenizer_files(mf: ModelFile) -> dict[str, bytes]:

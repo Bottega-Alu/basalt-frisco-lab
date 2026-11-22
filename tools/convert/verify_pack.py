@@ -63,7 +63,11 @@ def parse_index(text: bytes) -> dict:
 
 
 def verify(pack: str, first_gguf: str, workers: int = 16) -> bool:
-    if "quantized_from" in json.loads(ModelFile(pack).read("meta")):
+    meta = json.loads(ModelFile(pack).read("meta"))
+    if "quantized_from" in meta:
+        if meta.get("arch") == "gemma4":
+            import gemma4_bf16
+            return gemma4_bf16.verify(pack, first_gguf, workers)
         import hy4flash_bf16
         return hy4flash_bf16.verify(pack, first_gguf, workers)
     t0 = time.time()

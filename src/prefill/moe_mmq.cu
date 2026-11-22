@@ -92,7 +92,8 @@ __global__ void q2_kernel(const uint8_t* __restrict__ blob, uint16_t* __restrict
     for (int k = 0; k < 8; ++k) out[1 + k] = qh[k];
 }
 
-template <bool CAP>
+// A: 0 SwiGLU, 1 the softcapped SwiGLU, 2 GeGLU (gelu with the tanh approximation: Gemma 4)
+template <int A>
 __global__ void swiglu_kernel(const float* __restrict__ gu, float* __restrict__ h, int64_t rows, int64_t n_ff,
                               bool interleaved, const float4* __restrict__ tail, const int32_t* __restrict__ bounds, int n,
                               float cg, float cu, const int32_t* __restrict__ row_expert, size_t tail_stride) {
@@ -102,7 +103,8 @@ __global__ void swiglu_kernel(const float* __restrict__ gu, float* __restrict__ 
     const float* row = gu + r * 2 * n_ff;
     float g = interleaved ? row[2 * k] : row[k], u = interleaved ? row[2 * k + 1] : row[n_ff + k];
     if (tail == nullptr) {
-        if constexpr (CAP) h[i] = __fmul_rn(__fmul_rn(cg * tanhf(g / cg), 1.0f / (1.0f + expf(-g))), cu * tanhf(u / cu));
+        if constexpr (A == 1) h[i] = __fmul_rn(__fmul_rn(cg * tanhf(g / cg), 1.0f / (1.0f + expf(-g))), cu * tanhf(u / cu));
+        else if constexpr (A == 2) h[i] = 0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g))) * u;
         else h[i] = g / (1.0f + __expf(-g)) * u;
         return;
     }
@@ -114,7 +116,8 @@ __global__ void swiglu_kernel(const float* __restrict__ gu, float* __restrict__ 
     const float4 s = *(const float4*) ((const uint8_t*) tail + (size_t) q * tail_stride);   // {s_gate, s_up, s_down, -}
     g *= s.x;
     u *= s.y;
-    if constexpr (CAP) h[i] = __fmul_rn(__fmul_rn(cg * tanhf(g / cg), 1.0f / (1.0f + expf(-g))), cu * tanhf(u / cu)) * s.z;
+    if constexpr (A == 1) h[i] = __fmul_rn(__fmul_rn(cg * tanhf(g / cg), 1.0f / (1.0f + expf(-g))), cu * tanhf(u / cu)) * s.z;
+    else if constexpr (A == 2) h[i] = 0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g))) * u * s.z;
     else h[i] = g / (1.0f + __expf(-g)) * u * s.z;
 }
 
@@ -335,11 +338,14 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
     if (form.row_expert == nullptr && (bounds == nullptr || n <= 0)) tail = nullptr;
     const cudaStream_t s = (cudaStream_t) stream;
     const size_t ts = form.tail_stride ? form.tail_stride : sizeof(float4);
-    if (form.gate_softcap > 0.0f)
-        swiglu_kernel<true><<<blocks(rows * n_ff), 256, 0, s>>>(gu, h, rows, n_ff, interleaved, (const float4*) tail, bounds, n,
+    if (form.gelu)
+        swiglu_kernel<2><<<blocks(rows * n_ff), 256, 0, s>>>(gu, h, rows, n_ff, interleaved, (const float4*) tail, bounds, n,
+                                                             0.0f, 0.0f, form.row_expert, ts);
+    else if (form.gate_softcap > 0.0f)
+        swiglu_kernel<1><<<blocks(rows * n_ff), 256, 0, s>>>(gu, h, rows, n_ff, interleaved, (const float4*) tail, bounds, n,
                                                                 form.gate_softcap, form.up_softcap, form.row_expert, ts);
     else
-        swiglu_kernel<false><<<blocks(rows * n_ff), 256, 0, s>>>(gu, h, rows, n_ff, interleaved, (const float4*) tail, bounds, n,
+        swiglu_kernel<0><<<blocks(rows * n_ff), 256, 0, s>>>(gu, h, rows, n_ff, interleaved, (const float4*) tail, bounds, n,
                                                                  0.0f, 0.0f, form.row_expert, ts);
     ck(cudaGetLastError(), "swiglu");
 }

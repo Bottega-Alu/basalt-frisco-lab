@@ -117,6 +117,7 @@ struct SwigluForm {
     float gate_softcap = 0.0f, up_softcap = 0.0f;
     const int32_t* row_expert = nullptr;
     size_t tail_stride = 0;
+    bool gelu = false;   ///< GeGLU instead: h = gelu_tanh(g) * up, the tail scales as above (Gemma 4)
 };
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream,
             const float* tail = nullptr, const int32_t* bounds = nullptr, int n = 0, const SwigluForm& form = {});

@@ -67,11 +67,21 @@ PRE_PATTERNS = {"joyai-llm": JOYAI_PATTERNS, "hy_v4": JOYAI_PATTERNS, "inkling2"
 PRE_SOURCES = {"joyai-llm": "JOYAI_LLM", "hy_v4": "HY_V4", "inkling2": "GPT4O"}
 
 
+# `gemma4` (Gemma 4, GGUF tokenizer model "gemma4"): a SentencePiece-style BPE over characters, not bytes. The Hugging
+# Face tokenizer.json is: normalizer Replace(" " -> "▁"), a Split on " " that finds nothing after it (so the whole text
+# is one word), BPE with byte_fallback (a character outside the vocabulary becomes its UTF-8 bytes as <0xNN> tokens before
+# any merge), decoder Replace("▁" -> " ") + ByteFallback + Fuse.
+SPM_SPACE = "▁"
+SPM_MODELS = ("gemma4",)
+
+
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
-                 pre: str = "qwen35", special_ids: dict[str, int] | None = None):
+                 pre: str = "qwen35", special_ids: dict[str, int] | None = None, model: str = "gpt2"):
         self.tokens = tokens
-        self.pre = pre
+        self.model = model
+        self.spm = model in SPM_MODELS
+        self.pre = model if self.spm else pre
         self.token_types = token_types
         self.special_ids = special_ids or {}
         self.ids = {t: i for i, t in enumerate(tokens)}
@@ -87,7 +97,14 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._res = [regex.compile(p) for p in PRE_PATTERNS.get(pre, [QWEN35_PATTERN])]
+        self._res = [] if self.spm else [regex.compile(p) for p in PRE_PATTERNS.get(pre, [QWEN35_PATTERN])]
+        if self.spm:
+            # byte fallback: the 256 <0xNN> tokens must all be there, or a character outside the vocabulary has no ids
+            self._byte_ids = [self.ids.get("<0x%02X>" % b) for b in range(256)]
+            missing = [b for b, i in enumerate(self._byte_ids) if i is None]
+            if missing:
+                raise ValueError("SentencePiece vocabulary lacks %d byte tokens (<0x%02X> ...)" % (len(missing), missing[0]))
+            self._byte_of = {i: b for b, i in enumerate(self._byte_ids)}
 
         # Literals matched directly instead of through BPE (GGUF token types):
         #   * type 4 (USER_DEFINED: `<think>`, `<tool_call>`, ...) always matches, with or without parse_special;
@@ -122,13 +139,14 @@ class Tokenizer:
         if missing:
             raise ValueError("GGUF is missing %s; it does not carry a tokenizer" % ", ".join(missing))
         model = md.get("tokenizer.ggml.model")
-        if model != "gpt2":
-            raise ValueError("expected a byte-level BPE tokenizer (model 'gpt2'), got %r" % model)
+        if model != "gpt2" and model not in SPM_MODELS:
+            raise ValueError("expected a byte-level BPE tokenizer (model 'gpt2') or one of %s, got %r"
+                             % (", ".join(SPM_MODELS), model))
         special = {k: int(md[k]) for k in md
                    if k.startswith("tokenizer.ggml.") and k.endswith("_token_id")}
         return cls(list(md["tokenizer.ggml.tokens"]), list(md["tokenizer.ggml.merges"]),
                    list(md.get("tokenizer.ggml.token_type") or []) or None,
-                   md.get("tokenizer.ggml.pre", "qwen35"), special)
+                   md.get("tokenizer.ggml.pre", "qwen35"), special, model=model)
 
     # -------------------------------------------------------------- the algorithm
     def _bpe(self, word: str) -> list[str]:
@@ -207,7 +225,29 @@ class Tokenizer:
             pieces = nxt
         return pieces
 
+    def _encode_spm(self, text: str) -> list[int]:
+        """Gemma's tokenizer.json on plain text: spaces to U+2581, the whole text one word, each character outside the
+        vocabulary replaced by its UTF-8 byte tokens before merging (they never merge: merges name vocabulary tokens),
+        then merges by rank (_bpe/_bpe_heap take the symbol list)."""
+        if not text:
+            return []
+        cache = self.__dict__.setdefault("_piece_ids", {})
+        got = cache.get(text)
+        if got is None:
+            symbols: list[str] = []
+            for ch in text.replace(" ", SPM_SPACE):
+                if ch in self.ids:
+                    symbols.append(ch)
+                else:
+                    symbols.extend(self.tokens[self._byte_ids[b]] for b in ch.encode("utf-8"))
+            got = [self.ids[s] for s in self._bpe(symbols)]
+            if len(cache) < self.PIECE_CACHE_MAX and len(text) < 4096:
+                cache[text] = got
+        return got
+
     def _encode_plain(self, text: str) -> list[int]:
+        if self.spm:
+            return self._encode_spm(text)
         out: list[int] = []
         # A piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are looked up
         # instead of merged again. Same ids as running _bpe each time. Idea from Strata f346dc6 (MIT).
@@ -257,6 +297,11 @@ class Tokenizer:
         if b is None:
             if i < 0 or i >= len(self.tokens):
                 raise IndexError("token id %d is outside the vocabulary (%d)" % (i, len(self.tokens)))
+            if self.spm:
+                # decoder: Replace(U+2581 -> " "), ByteFallback (<0xNN> is that byte), Fuse; specials are their literal
+                byte = self._byte_of.get(i)
+                b = cache[i] = bytes([byte]) if byte is not None else self.tokens[i].replace(SPM_SPACE, " ").encode("utf-8")
+                return b
             raw = bytearray()
             for ch in self.tokens[i]:
                 v = UNICODE_TO_BYTE.get(ch)
@@ -291,14 +336,29 @@ def extract_metadata(md: dict, out_dir) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     tk = Tokenizer.from_metadata(md)
     cfg = {
-        "model": "gpt2",
+        "model": tk.model,
         "pre": tk.pre,
         "vocab_size": len(tk.tokens),
         "n_merges": len(tk.ranks),
         "special_ids": tk.special_ids,
-        "add_bos_token": False,
+        "add_bos_token": bool(md.get("tokenizer.ggml.add_bos_token", False)) if tk.spm else False,
         # shipped rather than re-derived by readers, so a port cannot lose the `\p{M}` classes
     }
+    if tk.spm:
+        # no pre-tokenizer: the text is one word after the space replacement; merges hold newlines and tabs, so they
+        # are a JSON list of pairs (merges.json), not merges.txt lines
+        cfg["normalizer"] = {"replace": " ", "with": SPM_SPACE}
+        cfg["byte_fallback"] = True
+        cfg["merges_file"] = "merges.json"
+        (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
+        (out / "merges.json").write_text(json.dumps([list(k) for k, _ in sorted(tk.ranks.items(), key=lambda kv: kv[1])],
+                                                    ensure_ascii=False), encoding="utf-8", newline="\n")
+        (out / "token_type.json").write_text(json.dumps(tk.token_types), encoding="utf-8")
+        (out / "tokenizer.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8", newline="\n")
+        tpl = md.get("tokenizer.chat_template")
+        if tpl:
+            (out / "chat_template.jinja").write_text(tpl, encoding="utf-8", newline="\n")
+        return cfg
     if tk.pre in PRE_PATTERNS:
         cfg["pre_patterns"] = PRE_PATTERNS[tk.pre]
         cfg["pre_pattern_source"] = ("llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_%s), applied in order"
