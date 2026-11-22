@@ -295,6 +295,12 @@ void kv_write(const float* k, const float* v, int rows, int kvh, int hd, int64_t
 
 void attention(const float* q, const uint16_t* kc, const uint16_t* vc, int rows, int n_head, int kvh, int hd, int64_t pos0,
                int window, int ring, float* out, void* stream) {
+    if (rows > 8 && attention_tiled(q, kc, vc, rows, n_head, kvh, hd, pos0, window, ring, out, stream)) return;
+    attention_simple(q, kc, vc, rows, n_head, kvh, hd, pos0, window, ring, out, stream);
+}
+
+void attention_simple(const float* q, const uint16_t* kc, const uint16_t* vc, int rows, int n_head, int kvh, int hd,
+                      int64_t pos0, int window, int ring, float* out, void* stream) {
     const dim3 grid((unsigned) n_head, (unsigned) rows);
     cudaStream_t s = (cudaStream_t) stream;
     if (hd == 256)
